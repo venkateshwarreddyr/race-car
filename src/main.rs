@@ -56,10 +56,6 @@ const PLAYER_SPEED: f32 = 250.0;
 const ROAD_SPEED: f32 = 400.0;
 fn game_logic(engine: &mut Engine, game_state: &mut GameState) {
     // game logic goes here
-    println!("{}", game_state.health_amount);
-    println!("{}", game_state.lost);
-    println!("--");
-
     if game_state.lost {
         return;
     }
