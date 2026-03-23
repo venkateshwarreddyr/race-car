@@ -1,121 +1,156 @@
-use rand::prelude::*;
-use rusty_engine::{game, prelude::*};
+mod collisions;
+mod constants;
+mod difficulty;
+mod game_state;
+mod hud;
+mod obstacles;
+mod player;
+mod powerups;
+mod road;
+mod scoring;
 
-struct GameState {
-    health_amount: u8,
-    lost: bool,
-}
+use rusty_engine::prelude::*;
+
+use constants::*;
+use game_state::{GameState, Phase};
 
 fn main() {
     let mut game = Game::new();
 
-    // game setup goes here
-    let player1 = game.add_sprite("player1", SpritePreset::RacingCarBlue);
-    player1.translation.x = -500.0;
-    player1.layer = 10.0;
-    player1.collision = true;
+    // Setup all subsystems
+    player::setup(&mut game);
+    road::setup(&mut game);
+    obstacles::setup(&mut game);
+    hud::setup(&mut game);
 
-    // audio
+    // Background music
     game.audio_manager
-        .play_music(MusicPreset::WhimsicalPopsicle, 0.2);
-
-    // create road
-    for i in 0..100 {
-        let roadline = game.add_sprite(format!("roadline{}", i), SpritePreset::RacingBarrierWhite);
-        roadline.scale = 0.1;
-        roadline.translation.x = -600.0 + 150.0 * i as f32;
-    }
-
-    // create obstacles
-    let obstacles_presents = vec![
-        SpritePreset::RacingBarrelBlue,
-        SpritePreset::RacingBarrelRed,
-        SpritePreset::RacingConeStraight,
-    ];
-
-    // create health message
-    let health_message = game.add_text("health_message", "Health: 5");
-    health_message.translation = Vec2::new(550.0, 320.0);
-
-    for (i, present) in obstacles_presents.into_iter().enumerate() {
-        let obstacle = game.add_sprite(format!("obstacle{}", i), present);
-        obstacle.layer = 5.0;
-        obstacle.collision = true;
-        obstacle.translation.x = thread_rng().gen_range(800.0..1600.0);
-        obstacle.translation.y = thread_rng().gen_range(-300.0..300.0);
-    }
+        .play_music(MusicPreset::WhimsicalPopsicle, MUSIC_VOLUME);
 
     game.add_logic(game_logic);
-    game.run(GameState {
-        health_amount: 5,
-        lost: false,
-    });
+    game.run(GameState::default());
 }
 
-const PLAYER_SPEED: f32 = 250.0;
-const ROAD_SPEED: f32 = 400.0;
 fn game_logic(engine: &mut Engine, game_state: &mut GameState) {
-    // game logic goes here
-    if game_state.lost {
-        return;
-    }
+    let dt = engine.delta_f32;
 
-    let mut direction = 0.0;
+    // ── Phase transitions via keyboard ──────────────────────────────
+    handle_input(engine, game_state);
 
-    if engine.keyboard_state.pressed(KeyCode::Up) {
-        direction += 1.0;
-    }
-
-    if engine.keyboard_state.pressed(KeyCode::Down) {
-        direction -= 1.0;
-    }
-
-    let player1 = engine.sprites.get_mut("player1").unwrap();
-    player1.translation.y += direction * PLAYER_SPEED * engine.delta_f32;
-
-    player1.rotation = direction * 0.15;
-
-    if player1.translation.y < -360.0 || player1.translation.y > 360.0 {
-        game_state.health_amount = 0;
-    }
-
-    for sprite in engine.sprites.values_mut() {
-        if sprite.label.starts_with("roadline") {
-            sprite.translation.x -= ROAD_SPEED * engine.delta_f32;
-
-            if sprite.translation.x < -670.9 {
-                sprite.translation.x += 1500.0;
-            }
+    match game_state.phase {
+        Phase::Menu => {
+            hud::update_overlays(engine, game_state);
+            return;
         }
+        Phase::Paused => {
+            hud::update_overlays(engine, game_state);
+            return;
+        }
+        Phase::GameOver => {
+            hud::update_overlays(engine, game_state);
+            return;
+        }
+        Phase::Playing => {}
+    }
 
-        if sprite.label.starts_with("obstacle") {
-            sprite.translation.x -= ROAD_SPEED * engine.delta_f32;
-            if sprite.translation.x < -800.0 {
-                sprite.translation.x = thread_rng().gen_range(800.0..1600.0);
-                sprite.translation.y = thread_rng().gen_range(-300.0..300.0);
-            }
+    // ── Active gameplay ─────────────────────────────────────────────
+    game_state.elapsed += dt;
+
+    // Player movement
+    let out_of_bounds = player::update(engine, game_state);
+    if out_of_bounds {
+        game_state.health = 0;
+    }
+
+    // Road scrolling
+    road::update(engine, game_state);
+
+    // Obstacles
+    let dodged = obstacles::update(engine, game_state);
+    obstacles::add_more(engine, game_state);
+
+    // Power-ups
+    powerups::spawn(engine, game_state);
+    powerups::update(engine, game_state);
+    powerups::tick_timers(game_state, dt);
+
+    // Collisions
+    let died = collisions::handle(engine, game_state);
+
+    // Scoring
+    scoring::update(game_state, dt, dodged);
+
+    // Difficulty
+    difficulty::update(game_state);
+
+    // HUD
+    hud::update(engine, game_state);
+    hud::update_overlays(engine, game_state);
+
+    // Check death
+    if died || out_of_bounds {
+        trigger_game_over(engine, game_state);
+    }
+}
+
+/// Handle keyboard input for phase transitions.
+fn handle_input(engine: &mut Engine, game_state: &mut GameState) {
+    // Enter → start from menu
+    if game_state.phase == Phase::Menu
+        && engine.keyboard_state.just_pressed(KeyCode::Return)
+    {
+        game_state.phase = Phase::Playing;
+    }
+
+    // P → toggle pause
+    if engine.keyboard_state.just_pressed(KeyCode::P) {
+        match game_state.phase {
+            Phase::Playing => game_state.phase = Phase::Paused,
+            Phase::Paused => game_state.phase = Phase::Playing,
+            _ => {}
         }
     }
 
-    //deal_collision
-    let health_message = engine.texts.get_mut("health_message").unwrap();
-    for event in engine.collision_events.drain(..) {
-        if !event.pair.either_contains("player1") || event.state.is_end() {
-            continue;
-        }
+    // R → restart (from game over or during play)
+    if engine.keyboard_state.just_pressed(KeyCode::R)
+        && (game_state.phase == Phase::GameOver || game_state.phase == Phase::Playing)
+    {
+        restart_game(engine, game_state);
+    }
+}
 
-        if game_state.health_amount > 0 {
-            game_state.health_amount -= 1;
-            health_message.value = format!("Health: {}", game_state.health_amount);
-            engine.audio_manager.play_sfx(SfxPreset::Impact3, 0.5);
-        }
+/// Transition to game-over state.
+fn trigger_game_over(engine: &mut Engine, game_state: &mut GameState) {
+    game_state.phase = Phase::GameOver;
+    if game_state.score > game_state.high_score {
+        game_state.high_score = game_state.score;
+    }
+    engine.audio_manager.stop_music();
+    engine.audio_manager.play_sfx(SfxPreset::Jingle3, SFX_VOLUME);
+}
+
+/// Reset everything for a fresh round.
+fn restart_game(engine: &mut Engine, game_state: &mut GameState) {
+    // Clear dynamic sprites
+    obstacles::clear(engine);
+    powerups::clear(engine);
+
+    // Reset player position
+    if let Some(player) = engine.sprites.get_mut("player1") {
+        player.translation.x = PLAYER_START_X;
+        player.translation.y = 0.0;
+        player.rotation = 0.0;
+        player.scale = 1.0;
     }
 
-    if game_state.health_amount == 0 {
-        game_state.lost = true;
-        let game_over = engine.add_text("game_over", "Game Over");
-        game_over.font_size = 128.0;
-        engine.audio_manager.stop_music();
-        engine.audio_manager.play_sfx(SfxPreset::Jingle3, 0.5);
-    }
+    // Reset state (preserves high score)
+    game_state.reset();
+
+    // Respawn obstacles
+    obstacles::respawn(engine, INITIAL_OBSTACLE_COUNT);
+
+    // Restart music
+    engine
+        .audio_manager
+        .play_music(MusicPreset::WhimsicalPopsicle, MUSIC_VOLUME);
 }
